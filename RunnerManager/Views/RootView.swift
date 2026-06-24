@@ -3,13 +3,14 @@ import AppKit
 
 /// The top-level content of the `MenuBarExtra` window.
 ///
-/// Layout:
+/// Layout (fixed-size popover; a plain HStack, NOT NavigationSplitView — see body):
 ///   ┌──────────────────────────────────────────────┐
 ///   │ BannerView (only when appState.banner != nil) │
+///   ├──────────────────────────────────────────────┤
+///   │ controlStrip: Refresh · New · Update All* · ⚙ · Quit │
 ///   ├───────────────┬──────────────────────────────┤
-///   │ RunnerListView│  RunnerDetailView / placeholder│   ← NavigationSplitView
+///   │ RunnerListView│  RunnerDetailView / placeholder│
 ///   └───────────────┴──────────────────────────────┘
-///   toolbar: Refresh · New Runner (sheet) · Update All* · Settings · Quit
 ///
 /// `RootView` owns the selected-runner id and the "new runner" sheet flag. It drives the app's
 /// lifecycle by calling `appState.onAppear()` from `.task`. All heavy work happens inside
@@ -41,14 +42,20 @@ struct RootView: View {
             controlStrip
             Divider()
 
-            NavigationSplitView {
+            // Two-pane layout (list | detail). We deliberately AVOID NavigationSplitView here:
+            // inside a MenuBarExtra(.window) popover it mis-renders its sidebar (the list can come
+            // up empty, looking like "no runners") and its sizing fights the popover — which also
+            // swallowed clicks on the control strip above. A plain HStack is reliable in a popover.
+            HStack(spacing: 0) {
                 RunnerListView(selection: $selection)
-            } detail: {
+                    .frame(width: 250)
+                Divider()
                 detailPane
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            // A reasonable minimum so the split view is usable in the popover-style window.
-            .frame(minWidth: 720, minHeight: 460)
         }
+        // Give the popover a deterministic size (a MenuBarExtra window sizes to its content).
+        .frame(width: 780, height: 520)
         .animation(.default, value: appState.banner)
         // Kick off the initial refresh + polling exactly once when the window first appears.
         .task {
@@ -182,14 +189,14 @@ struct RootView: View {
     /// window comes forward from the menu-bar context.
     private func openSettingsWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        let showSettings = Selector(("showSettingsWindow:"))
-        let showPreferences = Selector(("showPreferencesWindow:"))
-        if NSApp.responds(to: showSettings) {
-            NSApp.sendAction(showSettings, to: nil, from: nil)
-        } else {
-            // ASSUMPTION: on systems where the modern selector is unavailable, the legacy
-            // preferences selector opens the same Settings scene.
-            NSApp.sendAction(showPreferences, to: nil, from: nil)
+        // There's no SettingsLink on macOS 13, so we send the AppKit action the `Settings` scene
+        // installs into the responder chain. The selector was renamed: macOS 14+ uses
+        // "showSettingsWindow:", macOS 13 uses "showPreferencesWindow:". Gating on
+        // `NSApp.responds(to:)` is WRONG here — NSApplication doesn't implement these directly;
+        // they're handled further down the responder chain. `sendAction` returns false when nothing
+        // handled it, so try the modern selector first and fall back to the legacy one.
+        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
         }
     }
 }

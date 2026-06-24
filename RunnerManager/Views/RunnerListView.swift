@@ -54,6 +54,22 @@ struct RunnerListView: View {
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
+
+            // Diagnostic: show exactly which roots were scanned, so a runner that lives outside
+            // these paths is immediately obvious (add its parent in Settings → Search Paths).
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Searched roots")
+                    .font(.caption.bold())
+                    .foregroundColor(.secondary)
+                ForEach(appState.settings.searchPaths, id: \.self) { path in
+                    Text(path)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .padding(.top, 4)
         }
         .padding(24)
         .frame(minWidth: 240, maxWidth: .infinity, maxHeight: .infinity)
