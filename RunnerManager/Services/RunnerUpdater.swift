@@ -61,7 +61,13 @@ enum RunnerUpdater {
 
         // --- Skip if already at the target version. ----------------------------------------------
         // Read the installed version fresh (don't trust a possibly-stale enriched field on `runner`).
-        let installed = runner.installedVersion ?? (await VersionReader.installedVersion(at: installDir))
+        // `??` can't wrap an `await` — its default-value side is a non-async autoclosure — so resolve explicitly.
+        let installed: String?
+        if let known = runner.installedVersion {
+            installed = known
+        } else {
+            installed = await VersionReader.installedVersion(at: installDir)
+        }
         if let installed, Version.compare(installed, targetVersion) == .orderedSame {
             await report(progress, "Runner is already at version \(targetVersion); nothing to update.")
             return
