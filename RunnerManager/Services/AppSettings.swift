@@ -1,4 +1,5 @@
 import Foundation
+import Combine // ObservableObject / @Published live in Combine (Foundation does not re-export them)
 
 /// User-facing, non-secret application settings, backed by `UserDefaults.standard`.
 ///

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit // NSColor.textBackgroundColor — SwiftUI does not re-export AppKit
 
 /// A live tail of a runner's log files.
 ///
