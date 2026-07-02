@@ -60,6 +60,12 @@ final class AppState: ObservableObject {
     /// Human-readable progress line for long-running create/update flows (download, extract, …).
     @Published private(set) var progressText: String?
 
+    /// Timestamp of the END of the last successful `refreshAll()`, for the "Last refreshed" UI. nil until first refresh.
+    @Published private(set) var lastRefreshed: Date?
+
+    /// True while a create flow is in flight. Guards concurrent creates and disables the Create UI.
+    @Published private(set) var isCreating: Bool = false
+
     // MARK: - Dependencies
 
     /// User settings (search paths, poll interval, defaults). Injected so previews/tests can vary it.
@@ -121,8 +127,16 @@ final class AppState: ObservableObject {
     ///
     /// Each phase publishes its results as it completes so the UI fills in progressively.
     func refreshAll() async {
+        // Re-entrancy guard: a refresh already in flight (e.g. .task-on-open racing the AppDelegate's
+        // launch refresh) must not run twice concurrently and clobber each other's in-progress results.
+        guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
+
+        // Snapshot pre-refresh state so we can notify only on a genuine *transition* to updateAvailable
+        // for a runner we already knew (avoids first-load spam: unknown runners aren't in these sets).
+        let previouslyKnownIDs = Set(runners.map { $0.id })
+        let previouslyUpdatableIDs = Set(runners.filter { $0.updateAvailable }.map { $0.id })
 
         // --- 1. Discovery (pure filesystem; run off-main) ---
         // Snapshot the (main-actor) settings before hopping off-main; RunnerDiscovery is pure and
@@ -176,8 +190,25 @@ final class AppState: ObservableObject {
             }
         applyEnrichment(enriched)
 
+        // Notify on a real transition to updateAvailable for a previously-known runner (the in-app
+        // Update badge remains the reliable fallback). Skips first-load / brand-new runners.
+        if settings.notificationsEnabled {
+            for runner in runners
+            where runner.updateAvailable
+                && previouslyKnownIDs.contains(runner.id)
+                && !previouslyUpdatableIDs.contains(runner.id) {
+                NotificationService.post(
+                    title: "Runner update available",
+                    body: "\(runner.name) can be updated to \(runner.latestVersion ?? "the latest release")."
+                )
+            }
+        }
+
         // --- 4. Labels: one listRunners per distinct scope (needs a PAT) ---
         await refreshLabels(pat: pat)
+
+        // Stamp completion LAST (after all enrichment) so "Last refreshed" reflects a full pass.
+        lastRefreshed = Date()
     }
 
     /// Lightweight poll: re-run only `ServiceController.status` for each known runner, concurrently.
@@ -206,6 +237,17 @@ final class AppState: ObservableObject {
         // Apply by id (the array may have changed underneath us between snapshot and now).
         for (id, status) in statuses {
             if let index = runners.firstIndex(where: { $0.id == id }) {
+                // Detect a genuine running -> stopped transition BEFORE overwriting so we can notify.
+                // Skip runners mid user-action (busy): a poll racing the user's own stop/restart must
+                // not fire a spurious "stopped" notification for something they just did.
+                let previous = runners[index].status
+                if settings.notificationsEnabled, !busyRunnerIDs.contains(id),
+                   previous.isRunning, status == .stopped {
+                    NotificationService.post(
+                        title: "Runner stopped",
+                        body: "\(runners[index].name) is no longer running."
+                    )
+                }
                 runners[index].status = status
             }
         }
@@ -278,6 +320,30 @@ final class AppState: ObservableObject {
         note("Finished updating \(targets.count) runner\(targets.count == 1 ? "" : "s").", kind: .success)
     }
 
+    /// Start every runner that is installed-but-stopped. Sequential (reuses `start`/`performRunnerAction`
+    /// so each runner is marked busy and refreshed); runners already busy are skipped by that plumbing.
+    /// We target ONLY `.stopped` (not `.notInstalled`/`.error`/`.unknown`): starting a not-installed
+    /// service just fails and would spam error banners — and every runner is `.unknown` before the first
+    /// enrichment completes.
+    func startAll() async {
+        let targets = runners.filter { $0.status == .stopped && !busyRunnerIDs.contains($0.id) }
+        for runner in targets {
+            // Re-fetch the live runner by id in case the array changed between iterations.
+            guard let current = runners.first(where: { $0.id == runner.id }) else { continue }
+            await start(current)
+        }
+    }
+
+    /// Stop every runner that is currently running. Sequential (reuses `stop`/`performRunnerAction`);
+    /// runners already busy are skipped by that plumbing.
+    func stopAll() async {
+        let targets = runners.filter { $0.status.isRunning && !busyRunnerIDs.contains($0.id) }
+        for runner in targets {
+            guard let current = runners.first(where: { $0.id == runner.id }) else { continue }
+            await stop(current)
+        }
+    }
+
     /// Remove (de-register) a runner and tear down its service.
     ///
     /// Flow (per spec):
@@ -333,6 +399,11 @@ final class AppState: ObservableObject {
                 try await runConfigRemove(at: r.installPath, arguments: ["remove", "--local"])
             }
         } catch {
+            // config.sh remove failed. De-register via the API by agentId INDEPENDENTLY of config.sh's
+            // outcome so the registration is still torn down. Best-effort — swallow any API error.
+            if let pat, !pat.isEmpty, r.scope.apiBasePath != nil, let agentId = r.config?.agentId {
+                try? await GitHubAPI(token: pat).deleteRunner(scope: r.scope, id: agentId)
+            }
             report(error)
             // Even on de-registration failure, refresh status so the UI reflects the stopped service.
             await refreshSingleRunner(id: r.id, includeVersion: false)
@@ -377,8 +448,14 @@ final class AppState: ObservableObject {
     ///   - isOrg: true to register an organization runner (scope = .org(owner)); false for repo scope.
     func createRunnerWithPAT(owner: String, repo: String, isOrg: Bool, name: String?, labels: String?,
                              runnerGroup: String?, installRoot: URL) async {
+        // Guard against concurrent creates (also disables the Create UI while in flight).
+        guard !isCreating else { return }
+        isCreating = true
         progressText = nil
-        defer { progressText = nil }
+        defer {
+            isCreating = false
+            progressText = nil
+        }
 
         // Require a PAT for this path; tokens are minted server-side via the API.
         guard let pat = currentPAT(), !pat.isEmpty else {
@@ -431,8 +508,14 @@ final class AppState: ObservableObject {
     /// the block. The user may override name/labels/group/installRoot.
     func createRunnerFromBlock(_ pastedText: String, name: String?, labels: String?,
                                runnerGroup: String?, installRoot: URL) async {
+        // Guard against concurrent creates (also disables the Create UI while in flight).
+        guard !isCreating else { return }
+        isCreating = true
         progressText = nil
-        defer { progressText = nil }
+        defer {
+            isCreating = false
+            progressText = nil
+        }
 
         do {
             // BlockParser throws AppError.parse if url/token are missing; it never logs the token.
@@ -579,11 +662,14 @@ final class AppState: ObservableObject {
                 "The remove token was rejected (it may be expired — remove tokens last about an hour). Mint a fresh token and try again."
             )
         }
-        let stderr = result.stderr.isEmpty ? result.stdout : result.stderr
+        // SECURITY: do NOT surface raw stdout/stderr here. config.sh ran with the live remove-token on
+        // its command line and may echo it in a shape Log.redact can't reliably mask (remove tokens are
+        // not ghp_/github_pat_/40-hex). Pass a generic detail; keep the exit code. (The command field is
+        // safe — Log.redact masks the "--token <value>" argument.)
         throw AppError.process(
             command: Log.redact(result.commandLine),
             exitCode: result.exitCode,
-            stderr: stderr
+            stderr: "config.sh remove failed (exit \(result.exitCode)). Output withheld because it may contain the remove token."
         )
     }
 
@@ -599,8 +685,10 @@ final class AppState: ObservableObject {
 
         guard let index = runners.firstIndex(where: { $0.id == id }) else { return }
         runners[index].status = status
-        if includeVersion {
-            runners[index].installedVersion = version
+        // Only assign a non-nil version so a transient nil read doesn't wipe a known version
+        // (which would flicker the Update badge).
+        if includeVersion, let v = version {
+            runners[index].installedVersion = v
         }
     }
 
@@ -609,7 +697,9 @@ final class AppState: ObservableObject {
         for item in enriched {
             if let index = runners.firstIndex(where: { $0.id == item.id }) {
                 runners[index].status = item.status
-                runners[index].installedVersion = item.version
+                // Only assign a non-nil version so a transient nil read doesn't wipe a known version
+                // (which would flicker the Update badge).
+                if let v = item.version { runners[index].installedVersion = v }
             }
         }
     }
@@ -630,17 +720,18 @@ final class AppState: ObservableObject {
 
         let api = GitHubAPI(token: pat)
 
-        // Fetch each scope's runners concurrently (one call per scope), collecting name->labels maps.
-        let perScope: [(scope: RunnerScope, byName: [String: [String]])] =
-            await withTaskGroup(of: (RunnerScope, [String: [String]]?).self) { group in
+        // Fetch each scope's runners concurrently (one call per scope), collecting name->APIRunner maps
+        // so we can copy labels AND the server-side status/busy onto each matching local runner.
+        let perScope: [(scope: RunnerScope, byName: [String: APIRunner])] =
+            await withTaskGroup(of: (RunnerScope, [String: APIRunner]?).self) { group in
                 for scope in scopes {
                     group.addTask {
                         do {
                             let apiRunners = try await api.listRunners(scope: scope)
-                            // Map runner name -> its label names (order preserved from the API).
-                            var byName: [String: [String]] = [:]
+                            // Map runner name -> its full API record (order preserved from the API).
+                            var byName: [String: APIRunner] = [:]
                             for apiRunner in apiRunners {
-                                byName[apiRunner.name] = apiRunner.labels.map(\.name)
+                                byName[apiRunner.name] = apiRunner
                             }
                             return (scope, byName)
                         } catch {
@@ -651,19 +742,22 @@ final class AppState: ObservableObject {
                         }
                     }
                 }
-                var results: [(RunnerScope, [String: [String]])] = []
+                var results: [(RunnerScope, [String: APIRunner])] = []
                 for await (scope, map) in group {
                     if let map { results.append((scope, map)) }
                 }
                 return results
             }
 
-        // Apply: for each runner, look up its scope's map and copy labels matched by name.
+        // Apply: for each runner, look up its scope's map, match by name, and copy labels + API state.
         let maps = Dictionary(perScope.map { ($0.scope, $0.byName) }, uniquingKeysWith: { first, _ in first })
         for index in runners.indices {
             let runner = runners[index]
-            if let byName = maps[runner.scope], let labels = byName[runner.name] {
-                runners[index].labels = labels
+            if let byName = maps[runner.scope], let apiRunner = byName[runner.name] {
+                runners[index].labels = apiRunner.labels.map(\.name)
+                // Capture server-side state alongside labels (drives the GitHub online/busy badges).
+                runners[index].apiStatus = apiRunner.status
+                runners[index].apiBusy = apiRunner.busy
             }
         }
     }
@@ -691,6 +785,10 @@ final class AppState: ObservableObject {
         merged.installedVersion = old.installedVersion
         merged.latestVersion = old.latestVersion
         merged.labels = old.labels
+        // Preserve server-side API state too (populated alongside labels by refreshLabels) so the
+        // GitHub online/busy badge doesn't flicker to unknown while a refresh is re-discovering.
+        merged.apiStatus = old.apiStatus
+        merged.apiBusy = old.apiBusy
         return merged
     }
 

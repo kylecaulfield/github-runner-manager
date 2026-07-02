@@ -26,8 +26,16 @@ struct RunnerRowView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            // Status severity → colored dot (green/orange/red/gray).
+            // Status severity → colored dot (green/orange/red/gray). Reflects the LOCAL
+            // launchd service status.
             StatusDot(status: runner.status)
+
+            // GitHub's server-side view (online/offline + busy), shown only when known
+            // (i.e. a PAT enrichment matched this runner by name). nil → omit entirely so
+            // we never imply an "offline" state we haven't actually observed.
+            if let online = runner.gitHubOnline {
+                APIStateBadge(online: online, busy: runner.isBusyOnGitHub)
+            }
 
             // Name (primary) over scope (secondary). Both single-line and truncated so long
             // owner/repo strings don't blow out the sidebar width.
@@ -86,6 +94,12 @@ struct RunnerRowView: View {
     /// A combined description for assistive technologies: name, scope, status, and version.
     private var accessibilityLabel: String {
         var parts: [String] = [runner.name, runner.scope.displayName, runner.status.shortLabel]
+        if let online = runner.gitHubOnline {
+            parts.append(online ? "GitHub online" : "GitHub offline")
+            if runner.isBusyOnGitHub {
+                parts.append("running a job")
+            }
+        }
         if let version = runner.installedVersion, !version.isEmpty {
             parts.append("version \(version)")
         }

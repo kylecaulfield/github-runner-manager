@@ -35,11 +35,16 @@ enum VersionReader {
                 throwsOnNonZero: false
             )
 
-            // The version is printed to stdout; fall back to stderr only if stdout is empty.
-            let raw = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            let source = raw.isEmpty
-                ? result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                : raw
+            // A non-zero exit means we cannot trust the output as a version. Return nil rather than
+            // risk showing an stderr diagnostic as the version (which would falsely trip updateAvailable).
+            guard result.succeeded else {
+                Log.info("VersionReader: Runner.Listener --version exited non-zero at \(installPath.path)")
+                return nil
+            }
+
+            // The version is printed ONLY to stdout. We deliberately do NOT fall back to stderr:
+            // an stderr diagnostic is never a version string, and an empty stdout yields nil below.
+            let source = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
 
             // Defensive: take the first non-empty line in case the binary emits extra diagnostics.
             guard let line = source

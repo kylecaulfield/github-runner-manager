@@ -66,36 +66,45 @@ enum RunnerInstaller {
             in: request.installRoot, scope: request.scope, name: request.name)
         await report(progress, "Created install directory \(installDir.path)")
 
-        // --- 3. Download (reuse cache) + extract the tarball into the install directory. ---------
-        // Cache the tarball by its asset name so repeat installs/updates of the same version can
-        // reuse a prior download. The download deliberately does NOT send the PAT (see download()).
-        let cacheDir = downloadCache ?? AppPaths.downloadCache
-        try AppPaths.ensureDirectory(cacheDir)
-        let tarball = cacheDir.appendingPathComponent(asset.name)
+        // Everything past this point may fail after we've already created `installDir`. On ANY thrown
+        // error we remove the freshly-created directory (best-effort) so no orphaned half-install is
+        // left behind, then rethrow. We only ever remove the dir WE just created above.
+        do {
+            // --- 3. Download (reuse cache) + extract the tarball into the install directory. ------
+            // Cache the tarball by its asset name so repeat installs/updates of the same version can
+            // reuse a prior download. The download deliberately does NOT send the PAT (see download()).
+            let cacheDir = downloadCache ?? AppPaths.downloadCache
+            try AppPaths.ensureDirectory(cacheDir)
+            let tarball = cacheDir.appendingPathComponent(asset.name)
 
-        if isUsableCachedFile(tarball) {
-            await report(progress, "Reusing cached download \(asset.name)")
-        } else {
-            await report(progress, "Downloading \(asset.name)…")
-            try await download(asset, to: tarball, progress: progress)
+            if isUsableCachedFile(tarball, asset: asset) {
+                await report(progress, "Reusing cached download \(asset.name)")
+            } else {
+                await report(progress, "Downloading \(asset.name)…")
+                try await download(asset, to: tarball, progress: progress)
+            }
+
+            await report(progress, "Extracting runner package…")
+            try await extractTarball(tarball, into: installDir)
+
+            // --- 4. Register the runner with config.sh (unattended). -----------------------------
+            await report(progress, "Configuring runner with GitHub…")
+            try await runConfig(request: request, in: installDir)
+
+            // --- 5. Install + start the launchd service via svc.sh. ------------------------------
+            await report(progress, "Installing launchd service…")
+            try await ServiceController.install(at: installDir)
+            await report(progress, "Starting runner service…")
+            // Build a transient Runner just to drive svc.sh start through ServiceController.
+            try await ServiceController.start(RunnerDiscovery.makeRunner(installPath: installDir))
+
+            await report(progress, "Runner \(request.scope.displayName) v\(resolvedVersion) is installed and running.")
+            return installDir
+        } catch {
+            // Clean up only the directory we created in this call; leave the cache/other installs alone.
+            try? FileManager.default.removeItem(at: installDir)
+            throw error
         }
-
-        await report(progress, "Extracting runner package…")
-        try await extractTarball(tarball, into: installDir)
-
-        // --- 4. Register the runner with config.sh (unattended). ---------------------------------
-        await report(progress, "Configuring runner with GitHub…")
-        try await runConfig(request: request, in: installDir)
-
-        // --- 5. Install + start the launchd service via svc.sh. ----------------------------------
-        await report(progress, "Installing launchd service…")
-        try await ServiceController.install(at: installDir)
-        await report(progress, "Starting runner service…")
-        // Build a transient Runner just to drive svc.sh start through ServiceController.
-        try await ServiceController.start(RunnerDiscovery.makeRunner(installPath: installDir))
-
-        await report(progress, "Runner \(request.scope.displayName) v\(resolvedVersion) is installed and running.")
-        return installDir
     }
 
     /// Download an asset to `destination`, following redirects (URLSession does this by default,
@@ -272,27 +281,30 @@ enum RunnerInstaller {
                 + "Mint a fresh token and try again.")
         }
 
-        // Otherwise surface the real failure. The command is redacted so the token is never shown.
-        let stderr = result.stderr.isEmpty ? result.stdout : result.stderr
+        // Otherwise surface the real failure. We do NOT include raw config.sh stdout/stderr: it can
+        // contain the registration token, which is not ghp_/github_pat_/40-hex shaped and so cannot be
+        // reliably masked by Log.redact (same rationale as AppState.runConfigRemove). The command is
+        // redacted (its --token rule masks the token) and we keep the exit code.
         throw AppError.process(
             command: Log.redact(result.commandLine),
             exitCode: result.exitCode,
-            stderr: stderr.isEmpty ? "config.sh failed to register the runner." : stderr
+            stderr: "config.sh failed to register the runner. Output withheld because it may contain the registration token."
         )
     }
 
     /// Heuristic for "config.sh rejected the registration token (expired/invalid)".
     ///
     /// config.sh prints, on a bad/expired token under `--unattended`:
-    ///   "… Terminating unattended configuration" alongside HTTP auth errors (401). We also match
-    /// the generic "invalid"/"expired" wording so a token problem is reported as `AppError.invalidToken`
-    /// rather than a raw process failure.
+    ///   "… Terminating unattended configuration" alongside HTTP auth errors (401). We match ONLY
+    /// unambiguous auth signals so a token problem is reported as `AppError.invalidToken`. The bare
+    /// "invalid"/"expired" substrings were dropped: they misclassify unrelated failures (e.g. a bad
+    /// runner group or labels) as token errors.
     private static func looksLikeInvalidToken(_ output: String) -> Bool {
         let lower = output.lowercased()
         return lower.contains("terminating unattended configuration")
             || lower.contains("401")
-            || lower.contains("invalid")
-            || lower.contains("expired")
+            || lower.contains("unauthorized")
+            || lower.contains("bad credentials")
     }
 
     // MARK: - Install directory + cache helpers
@@ -367,13 +379,18 @@ enum RunnerInstaller {
         return out
     }
 
-    /// A cached download is usable iff the file exists AND is non-empty (a zero-byte file is a
-    /// failed prior download and must be re-fetched).
-    private static func isUsableCachedFile(_ url: URL) -> Bool {
+    /// A cached download is usable iff the file exists AND is non-empty. When the release asset
+    /// reports a `size`, the cached file must match it exactly — a mismatch means a truncated/partial
+    /// prior download, so we re-fetch. When the size is unknown we fall back to the "exists && >0" check.
+    private static func isUsableCachedFile(_ url: URL, asset: GitHubAsset) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: url.path) else { return false }
-        let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int
-        return (size ?? 0) > 0
+        let onDisk = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int
+        guard let onDisk, onDisk > 0 else { return false }
+        if let expected = asset.size, expected > 0 {
+            return onDisk == expected
+        }
+        return true
     }
 
     /// Hop a progress line back to the main actor for the UI.

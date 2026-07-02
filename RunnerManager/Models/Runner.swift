@@ -59,6 +59,10 @@ struct Runner: Identifiable, Equatable {
     /// from `GET …/actions/runners` and require a PAT. Empty when unknown.
     var labels: [String] = []
 
+    /// GitHub API runner state (server-side), populated during label enrichment when a PAT is set.
+    var apiStatus: String?   // "online" / "offline" (APIRunner.status); nil when unknown / no PAT
+    var apiBusy: Bool?       // APIRunner.busy; nil when unknown
+
     // MARK: - Derived paths
 
     /// The runner's `_diag` directory, where `Runner_*.log`/`Worker_*.log` files are written.
@@ -91,6 +95,11 @@ struct Runner: Identifiable, Equatable {
         guard let i = installedVersion, let l = latestVersion else { return false }
         return Version.isNewer(l, than: i)
     }
+
+    /// Whether GitHub currently sees this runner as online. nil when unknown (no PAT / not matched).
+    var gitHubOnline: Bool? { apiStatus.map { $0.lowercased() == "online" } }
+    /// Whether GitHub reports this runner as mid-job. Only true when we positively know it.
+    var isBusyOnGitHub: Bool { apiBusy == true }
 
     // MARK: - Helpers
 

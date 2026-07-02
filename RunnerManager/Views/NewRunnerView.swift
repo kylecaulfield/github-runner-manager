@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The "New Runner" sheet. Presents two ways to register a self-hosted runner, in a `TabView`:
+/// The "New Runner" window. Presents two ways to register a self-hosted runner, in a `TabView`:
 ///
 ///  - **Stored PAT** (Path A): the user types the owner/repo (or org), optional name/labels/group
 ///    and an install root. We mint a registration token server-side via the stored PAT and run the
@@ -16,7 +16,7 @@ import SwiftUI
 /// success/error `banner`. This view only collects input, shows progress, and dismisses on success.
 ///
 /// SECURITY: the pasted block contains a short-lived *registration* token (not a PAT). It lives only
-/// in this view's transient `@State` while the sheet is open and is handed straight to `AppState`,
+/// in this view's transient `@State` while the window is open and is handed straight to `AppState`,
 /// which passes it transiently to `config.sh`. We never persist or log it. The stored PAT is read
 /// only inside `AppState`/`KeychainStore`; this view only asks `KeychainStore.hasPAT()` (a Bool).
 struct NewRunnerView: View {
@@ -48,12 +48,14 @@ struct NewRunnerView: View {
 
     // MARK: - Shared transient UI state
 
-    /// True while a create flow is in flight (disables inputs/buttons, shows progress).
-    @State private var isCreating = false
-
-    /// Whether the PAT is present, snapshotted on appear so the notice is stable while the sheet
+    /// Whether the PAT is present, snapshotted on appear so the notice is stable while the window
     /// is open. (We avoid calling the Keychain on every render.)
     @State private var hasPAT: Bool = false
+
+    /// True while a create flow is in flight. Owned by `AppState` (it guards concurrent creates and
+    /// resets via `defer`), so the whole window's controls disable/enable off the shared source of
+    /// truth rather than a local copy.
+    private var isCreating: Bool { appState.isCreating }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -329,7 +331,8 @@ struct NewRunnerView: View {
         // the flow finishes — a `.success` banner means we should dismiss, `.error` keeps us open.
         let priorBannerID = appState.banner?.id
 
-        isCreating = true
+        // AppState owns `isCreating` (sets it true on entry, resets via defer), so we don't toggle
+        // any local flag here — the window's controls track `appState.isCreating` directly.
         Task {
             switch selectedTab {
             case .storedPAT:
@@ -354,8 +357,7 @@ struct NewRunnerView: View {
             }
 
             // Back on the main actor (this Task is created from a @MainActor view). Decide outcome
-            // from the banner AppState posted: a fresh success banner => dismiss the sheet.
-            isCreating = false
+            // from the banner AppState posted: a fresh success banner => dismiss the window.
             if let banner = appState.banner,
                banner.id != priorBannerID,
                banner.kind == .success {

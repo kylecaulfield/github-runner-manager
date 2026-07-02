@@ -169,7 +169,16 @@ enum LogReader {
             // Fall back to distantPast when the modification date is unavailable so a dated file
             // always wins over an undatable one.
             let modDate = values?.contentModificationDate ?? .distantPast
-            if modDate >= newestDate {
+            // Pick a strictly-newer file; on an exact date tie, break deterministically by filename
+            // (the runner names these files with a lexical timestamp, so the greater name is newer).
+            // The `?? true` also handles the very first matching entry (newestURL == nil).
+            let isNewer: Bool
+            if modDate != newestDate {
+                isNewer = modDate > newestDate
+            } else {
+                isNewer = newestURL.map { entry.lastPathComponent > $0.lastPathComponent } ?? true
+            }
+            if isNewer {
                 newestDate = modDate
                 newestURL = entry
             }

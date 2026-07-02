@@ -135,6 +135,8 @@ struct GitHubAPI {
         // Required GitHub headers. We pin the API version per GitHub's recommendation.
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        // GitHub expects a User-Agent on every request; identify ourselves (no PAT is in this header).
+        request.setValue("RunnerManager", forHTTPHeaderField: "User-Agent")
         // Authorization is sent ONLY when a PAT is present (release reads work unauthenticated).
         if let token, !token.isEmpty {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -176,10 +178,16 @@ struct GitHubAPI {
 
         switch status {
         case 401, 403:
-            // AppError.github's description already adds a generic PAT/Administration hint for 401/403,
-            // but make the required permission explicit here too.
-            message += " (check the PAT and that it has Administration: Read and write)"
-        case 404:
+            if scope != nil {
+                // Scoped/authed runner endpoint: a 401/403 almost always means the PAT is missing or
+                // lacks the required permission, so make that explicit.
+                message += " (check the PAT and that it has Administration: Read and write)"
+            } else {
+                // Public (unauthenticated) release read: a 403 here is almost always rate limiting,
+                // NOT a permissions problem — the Administration hint would be misleading.
+                message += " (this is usually GitHub API rate limiting for unauthenticated requests; set a PAT or wait and retry)"
+            }
+        case 404 where scope != nil:
             // For runner endpoints a 404 is usually a permissions problem, not a missing resource.
             if isWriteEndpoint {
                 message += " (a 404 here usually means the PAT is missing the Administration: Read and write permission for this repository/organization)"

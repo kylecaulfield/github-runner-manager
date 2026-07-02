@@ -40,18 +40,34 @@ struct SettingsView: View {
     /// Tint for `patStatusMessage`.
     @State private var patStatusIsError: Bool = false
 
+    // MARK: - Startup (Launch at Login) state
+
+    /// Mirrors `LoginItemService.isEnabled`. Seeded on appear and after each toggle so the switch
+    /// reflects the actual registration state rather than an optimistic guess.
+    @State private var launchAtLogin: Bool = false
+
+    /// A transient inline error for the Launch-at-Login toggle (e.g. SMAppService registration failed).
+    @State private var launchAtLoginError: String?
+
     var body: some View {
         Form {
             searchPathsSection
             patSection
             pollingSection
             defaultsSection
+            startupSection
+            notificationsSection
+            aboutSection
         }
         .formStyle(.grouped)
         .frame(width: 560)
         // A fixed minimum height keeps all sections comfortably visible; the grouped form scrolls if needed.
         .frame(minHeight: 520)
-        .onAppear { refreshPATStatus() }
+        .onAppear {
+            refreshPATStatus()
+            // Seed the login-item toggle from the live registration status.
+            launchAtLogin = LoginItemService.isEnabled
+        }
     }
 
     // MARK: - Search Paths
@@ -347,6 +363,89 @@ struct SettingsView: View {
                  + "Runner group applies only to organization/enterprise runners.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+        }
+    }
+
+    // MARK: - Startup
+
+    private var startupSection: some View {
+        Section {
+            Toggle("Launch at login", isOn: $launchAtLogin)
+                // Register/unregister the app as a Login Item when the user flips the switch.
+                .onChange(of: launchAtLogin) { newValue in
+                    // Only act on a genuine USER toggle. Ignore programmatic changes — the
+                    // seed-on-appear (launchAtLogin = isEnabled) and the revert-on-failure below both
+                    // reassign this binding; without this guard they'd re-enter and cause a spurious
+                    // re-registration on every Settings open and would clobber the just-set error.
+                    guard newValue != LoginItemService.isEnabled else { return }
+                    do {
+                        try LoginItemService.setEnabled(newValue)
+                        launchAtLoginError = nil
+                    } catch {
+                        // Revert the visual state to the actual registration status and surface why.
+                        launchAtLoginError = (error as? LocalizedError)?.errorDescription
+                            ?? error.localizedDescription
+                        launchAtLogin = LoginItemService.isEnabled
+                    }
+                }
+
+            if let launchAtLoginError {
+                Text(launchAtLoginError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .textSelection(.enabled)
+            }
+        } header: {
+            Text("Startup")
+        } footer: {
+            Text("Start RunnerManager automatically when you log in. "
+                 + "Ad-hoc or unsigned builds may not persist this reliably.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    // MARK: - Notifications
+
+    private var notificationsSection: some View {
+        Section {
+            Toggle("Enable notifications", isOn: $settings.notificationsEnabled)
+                // When turning on, request authorization once (best-effort; failure just means no delivery).
+                .onChange(of: settings.notificationsEnabled) { enabled in
+                    if enabled {
+                        Task { await NotificationService.requestAuthorizationIfNeeded() }
+                    }
+                }
+        } header: {
+            Text("Notifications")
+        } footer: {
+            Text("Post a local notification when a runner stops or an update becomes available. "
+                 + "Ad-hoc signing may block delivery; the in-app banner still works either way.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    // MARK: - About
+
+    private var aboutSection: some View {
+        Section {
+            LabeledContent("Version", value: appVersionString)
+        } header: {
+            Text("About")
+        }
+    }
+
+    /// "x.y.z (build)" assembled from the bundle's short version + build number. Falls back gracefully
+    /// when either key is missing (e.g. a bare test host).
+    private var appVersionString: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        switch (short, build) {
+        case let (s?, b?): return "\(s) (\(b))"
+        case let (s?, nil): return s
+        case let (nil, b?): return b
+        case (nil, nil): return "Unknown"
         }
     }
 }

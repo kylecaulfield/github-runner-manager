@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit // NSWorkspace (Open on GitHub) + NSPasteboard (Copy install path)
 
 /// The detail pane for a single selected runner.
 ///
@@ -115,6 +116,22 @@ struct RunnerDetailView: View {
                 }
             }
 
+            // Server-side view from the GitHub API (only shown when known — i.e. a PAT is set and
+            // this runner was matched during label enrichment). nil status => row omitted entirely.
+            if let gitHubStatusText {
+                LabeledRow("GitHub") {
+                    HStack(spacing: 6) {
+                        Image(systemName: (runner.gitHubOnline == true) ? "circle.fill" : "circle")
+                            .font(.system(size: 8))
+                            .foregroundColor((runner.gitHubOnline == true) ? .green : .secondary)
+                            .accessibilityHidden(true)
+                        Text(gitHubStatusText)
+                            .font(.callout)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+
             HStack(spacing: 8) {
                 // Start is meaningful only when the runner is not already running.
                 Button("Start") {
@@ -164,6 +181,14 @@ struct RunnerDetailView: View {
         }
     }
 
+    /// Human-readable GitHub-API state, or nil when unknown (no PAT / not matched). Includes the
+    /// "running a job" note when the API positively reports the runner is busy.
+    private var gitHubStatusText: String? {
+        guard let online = runner.gitHubOnline else { return nil }
+        let base = online ? "Online" : "Offline"
+        return runner.isBusyOnGitHub ? "\(base) — running a job" : base
+    }
+
     // MARK: - Version
 
     private var versionSection: some View {
@@ -182,6 +207,14 @@ struct RunnerDetailView: View {
                     .disabled(isBusy)
                 }
                 .padding(.top, 2)
+
+                // Warn that updating will interrupt an in-progress job (GitHub API reports busy).
+                if runner.isBusyOnGitHub {
+                    Label(busyWarningText, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else if runner.installedVersion != nil, runner.latestVersion != nil {
                 // Both versions are known and equal-or-newer locally: nothing to do.
                 Text("Up to date.")
@@ -262,7 +295,36 @@ struct RunnerDetailView: View {
             if let label = runner.serviceLabel {
                 LabeledRow("Service label", value: label)
             }
+
+            // Quick actions: jump to this scope's runners page on github.com, or copy the local path.
+            HStack(spacing: 8) {
+                Button {
+                    if let url = runner.scope.runnersSettingsURL {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Label("Open on GitHub", systemImage: "arrow.up.forward.square")
+                }
+                // Enterprise/repo/org have a URL; only .unknown scope yields nil.
+                .disabled(runner.scope.runnersSettingsURL == nil)
+                .help("Open this scope's self-hosted runners page on github.com")
+
+                Button {
+                    copyInstallPath()
+                } label: {
+                    Label("Copy install path", systemImage: "doc.on.doc")
+                }
+                .help("Copy the install directory path to the clipboard")
+            }
+            .padding(.top, 2)
         }
+    }
+
+    /// Copy the runner's install directory path to the system clipboard.
+    private func copyInstallPath() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(runner.installPath.path, forType: .string)
     }
 
     // MARK: - Logs
@@ -295,6 +357,14 @@ struct RunnerDetailView: View {
             }
             .disabled(isBusy)
 
+            // Surface the interrupt warning inline too (not only in the confirmation dialog).
+            if runner.isBusyOnGitHub {
+                Label(busyWarningText, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Text("Stops the service, de-registers the runner from GitHub (using your PAT when available), and uninstalls the launchd service.")
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -306,12 +376,21 @@ struct RunnerDetailView: View {
         deleteDirectoryOnRemove ? "Remove and Delete Directory" : "Remove"
     }
 
-    /// Explanatory message inside the confirmation dialog.
+    /// Explanatory message inside the confirmation dialog. Prepends the busy-on-GitHub warning when
+    /// the API reports this runner is mid-job so the user knows the remove will interrupt it.
     private var removeConfirmMessage: String {
+        let base: String
         if deleteDirectoryOnRemove {
-            return "This stops and uninstalls the service, de-registers the runner from GitHub, and permanently deletes the install directory at \(runner.installPath.path). This cannot be undone."
+            base = "This stops and uninstalls the service, de-registers the runner from GitHub, and permanently deletes the install directory at \(runner.installPath.path). This cannot be undone."
+        } else {
+            base = "This stops and uninstalls the service and de-registers the runner from GitHub. The install directory at \(runner.installPath.path) is kept."
         }
-        return "This stops and uninstalls the service and de-registers the runner from GitHub. The install directory at \(runner.installPath.path) is kept."
+        return runner.isBusyOnGitHub ? "\(busyWarningText)\n\n\(base)" : base
+    }
+
+    /// Shared warning shown before destructive/interrupting actions when GitHub reports a live job.
+    private var busyWarningText: String {
+        "This runner is currently running a job — updating/removing will interrupt it."
     }
 
     // MARK: - Small helpers

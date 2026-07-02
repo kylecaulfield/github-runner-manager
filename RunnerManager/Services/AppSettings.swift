@@ -22,12 +22,14 @@ final class AppSettings: ObservableObject {
         static let defaultInstallRoot = "defaultInstallRoot"
         static let maxDiscoveryDepth = "maxDiscoveryDepth"
         static let logTailLines = "logTailLines"
+        static let notificationsEnabled = "notificationsEnabled"
     }
 
     // MARK: - Clamp ranges (per spec)
 
     private static let pollIntervalRange: ClosedRange<Double> = 2.0...60.0
     private static let discoveryDepthRange: ClosedRange<Int> = 1...6
+    private static let logTailLinesRange: ClosedRange<Int> = 50...5000
 
     /// Guards `didSet` persistence so that loading values in `init()` does not
     /// trigger redundant writes back to `UserDefaults`.
@@ -76,9 +78,21 @@ final class AppSettings: ObservableObject {
         }
     }
 
-    /// Number of trailing log lines to show in the log tail view. Default 200.
+    /// Number of trailing log lines to show in the log tail view. Default 200, clamped to 50…5000.
     @Published var logTailLines: Int {
-        didSet { persist(logTailLines, forKey: Keys.logTailLines) }
+        didSet {
+            let clamped = AppSettings.logTailLinesRange.clamping(logTailLines)
+            if clamped != logTailLines {
+                logTailLines = clamped
+                return
+            }
+            persist(logTailLines, forKey: Keys.logTailLines)
+        }
+    }
+
+    /// Whether to post local notifications on notable runner events. Default false.
+    @Published var notificationsEnabled: Bool {
+        didSet { persist(notificationsEnabled, forKey: Keys.notificationsEnabled) }
     }
 
     // MARK: - Defaults
@@ -123,12 +137,16 @@ final class AppSettings: ObservableObject {
                 defaults.integer(forKey: Keys.maxDiscoveryDepth))
         }
 
-        // logTailLines: default 200 if unset.
+        // logTailLines: default 200 if unset, else clamp.
         if defaults.object(forKey: Keys.logTailLines) == nil {
             logTailLines = 200
         } else {
-            logTailLines = defaults.integer(forKey: Keys.logTailLines)
+            logTailLines = AppSettings.logTailLinesRange.clamping(
+                defaults.integer(forKey: Keys.logTailLines))
         }
+
+        // notificationsEnabled: default false if unset.
+        notificationsEnabled = defaults.bool(forKey: Keys.notificationsEnabled)
 
         isLoading = false
     }

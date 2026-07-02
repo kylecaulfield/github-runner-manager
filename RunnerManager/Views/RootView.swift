@@ -12,19 +12,26 @@ import AppKit
 ///   │ RunnerListView│  RunnerDetailView / placeholder│
 ///   └───────────────┴──────────────────────────────┘
 ///
-/// `RootView` owns the selected-runner id and the "new runner" sheet flag. It drives the app's
-/// lifecycle by calling `appState.onAppear()` from `.task`. All heavy work happens inside
-/// `AppState`/services (off-main by construction); this view only kicks off async work and reads
-/// published state, so it never blocks the main thread.
+/// `RootView` owns the selected-runner id plus the search/sort UI state. Launch-time discovery
+/// and polling are owned by `AppDelegate` (`appState.onAppear()` at launch); this view only
+/// refreshes on open via `.task`. All heavy work happens inside `AppState`/services (off-main by
+/// construction); this view only kicks off async work and reads published state, so it never
+/// blocks the main thread.
 struct RootView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var settings: AppSettings
 
+    /// Opens auxiliary windows (the "New Runner" window scene) from within the popover.
+    @Environment(\.openWindow) private var openWindow
+
     /// The currently selected runner id (== install path). Drives the detail pane.
     @State private var selection: Runner.ID?
 
-    /// Whether the "New Runner" sheet is presented.
-    @State private var showingNewRunner = false
+    /// Free-text filter matched (case-insensitively) against runner name and scope.
+    @State private var searchText = ""
+
+    /// The order the runner list is sorted in.
+    @State private var sortOrder: RunnerSort = .status
 
     var body: some View {
         VStack(spacing: 0) {
@@ -42,12 +49,21 @@ struct RootView: View {
             controlStrip
             Divider()
 
+            // At-a-glance counts + when we last refreshed.
+            summaryHeader
+            Divider()
+
+            // Search + sort controls for the runner list.
+            filterBar
+            Divider()
+
             // Two-pane layout (list | detail). We deliberately AVOID NavigationSplitView here:
             // inside a MenuBarExtra(.window) popover it mis-renders its sidebar (the list can come
             // up empty, looking like "no runners") and its sizing fights the popover — which also
             // swallowed clicks on the control strip above. A plain HStack is reliable in a popover.
             HStack(spacing: 0) {
-                RunnerListView(selection: $selection)
+                // RootView owns filtering/sorting; the list just renders what it's given.
+                RunnerListView(runners: filteredRunners, selection: $selection)
                     .frame(width: 250)
                 Divider()
                 detailPane
@@ -57,15 +73,10 @@ struct RootView: View {
         // Give the popover a deterministic size (a MenuBarExtra window sizes to its content).
         .frame(width: 780, height: 520)
         .animation(.default, value: appState.banner)
-        // Kick off the initial refresh + polling exactly once when the window first appears.
+        // Refresh whenever the popover opens. Launch-time discovery + polling are owned by
+        // AppDelegate; refreshAll is @MainActor async and re-entrancy-guarded, so this is safe.
         .task {
-            appState.onAppear()
-        }
-        // The "New Runner" flow lives in a sheet so it can present its own TabView form.
-        .sheet(isPresented: $showingNewRunner) {
-            NewRunnerView()
-                .environmentObject(appState)
-                .environmentObject(settings)
+            await appState.refreshAll()
         }
     }
 
@@ -111,6 +122,113 @@ struct RootView: View {
         .accessibilityElement(children: .combine)
     }
 
+    // MARK: - Summary header
+
+    /// A compact status line: running / stopped / update counts, plus when we last refreshed.
+    private var summaryHeader: some View {
+        HStack(spacing: 14) {
+            summaryChip(count: runningCount, label: "running", systemImage: "play.circle.fill", color: .green)
+            summaryChip(count: stoppedCount, label: "stopped", systemImage: "stop.circle.fill", color: .orange)
+            summaryChip(count: updateCount, label: "updates", systemImage: "arrow.down.circle.fill", color: .accentColor)
+
+            Spacer(minLength: 8)
+
+            if let last = appState.lastRefreshed {
+                Text("Last refreshed \(last.formatted(.relative(presentation: .named)))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .help("Last successful refresh: \(last.formatted(date: .abbreviated, time: .standard))")
+            } else {
+                Text("Not refreshed yet")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// One count chip (e.g. "3 running") for the summary header.
+    private func summaryChip(count: Int, label: String, systemImage: String, color: Color) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .foregroundColor(color)
+                .accessibilityHidden(true)
+            Text("\(count) \(label)")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(count) \(label)")
+    }
+
+    private var runningCount: Int { appState.runners.filter { $0.status.isRunning }.count }
+    private var stoppedCount: Int { appState.runners.filter { $0.status == .stopped }.count }
+    private var updateCount: Int { appState.runners.filter { $0.updateAvailable }.count }
+
+    // MARK: - Filter bar
+
+    /// Search field + sort picker. A plain `TextField` (NOT `.searchable`, which requires a
+    /// navigation container we deliberately avoid inside the popover).
+    private var filterBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(.secondary)
+                .accessibilityHidden(true)
+            TextField("Filter runners", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 220)
+
+            Spacer(minLength: 8)
+
+            Picker("Sort", selection: $sortOrder) {
+                ForEach(RunnerSort.allCases) { order in
+                    Text(order.label).tag(order)
+                }
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+            .help("Sort the runner list")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// The runners actually shown in the list: filtered by `searchText` (name/scope, case-
+    /// insensitive) and ordered by `sortOrder`. RootView owns this so `RunnerListView` stays dumb.
+    private var filteredRunners: [Runner] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let matched = query.isEmpty ? appState.runners : appState.runners.filter { runner in
+            runner.name.lowercased().contains(query)
+                || runner.scope.displayName.lowercased().contains(query)
+        }
+        return matched.sorted { lhs, rhs in
+            switch sortOrder {
+            case .status:
+                let l = Self.statusRank(lhs.status), r = Self.statusRank(rhs.status)
+                if l != r { return l < r }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            case .name:
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            case .repo:
+                let cmp = lhs.scope.displayName.localizedCaseInsensitiveCompare(rhs.scope.displayName)
+                if cmp != .orderedSame { return cmp == .orderedAscending }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+        }
+    }
+
+    /// Ordering rank for `.status` sort: running first, then problems, then inert states.
+    private static func statusRank(_ status: RunnerStatus) -> Int {
+        switch status {
+        case .running: return 0
+        case .stopped: return 1
+        case .error: return 2
+        case .notInstalled: return 3
+        case .unknown: return 4
+        }
+    }
+
     // MARK: - Control strip
 
     /// True when at least one discovered runner has a newer release available. Drives the
@@ -135,15 +253,38 @@ struct RootView: View {
                 }
             }
             .disabled(appState.isRefreshing)
-            .help("Rescan for runners and refresh status, versions, and labels")
+            .keyboardShortcut("r")
+            .help("Rescan for runners and refresh status, versions, and labels (⌘R)")
 
-            // New Runner: opens the create sheet (PAT form or paste-block).
+            // New Runner: opens the dedicated "New Runner" window (id "new-runner"). We activate
+            // the app so the window comes forward from the menu-bar (accessory) context.
             Button {
-                showingNewRunner = true
+                openWindow(id: "new-runner")
+                NSApp.activate(ignoringOtherApps: true)
             } label: {
                 Label("New Runner", systemImage: "plus")
             }
-            .help("Add a new self-hosted runner")
+            .keyboardShortcut("n")
+            .help("Add a new self-hosted runner (⌘N)")
+
+            // Bulk actions: start every non-running runner / stop every running runner.
+            Menu {
+                Button {
+                    Task { await appState.startAll() }
+                } label: {
+                    Label("Start All", systemImage: "play.fill")
+                }
+                Button {
+                    Task { await appState.stopAll() }
+                } label: {
+                    Label("Stop All", systemImage: "stop.fill")
+                }
+            } label: {
+                Label("Bulk", systemImage: "square.stack.3d.up")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Start or stop all runners at once")
 
             // Update All: only shown when something can be updated.
             if anyUpdateAvailable {
@@ -197,6 +338,24 @@ struct RootView: View {
         // handled it, so try the modern selector first and fall back to the legacy one.
         if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
             NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+        }
+    }
+}
+
+/// How the runner list is ordered. Backed by a `String` so it can be persisted later if desired.
+enum RunnerSort: String, CaseIterable, Identifiable {
+    case status
+    case name
+    case repo
+
+    var id: String { rawValue }
+
+    /// User-facing label for the sort picker.
+    var label: String {
+        switch self {
+        case .status: return "Status"
+        case .name: return "Name"
+        case .repo: return "Repository"
         }
     }
 }

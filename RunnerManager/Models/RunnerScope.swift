@@ -89,6 +89,16 @@ enum RunnerScope: Equatable, Hashable {
         }
     }
 
+    /// The GitHub web page that lists this scope's self-hosted runners (for "Open on GitHub").
+    var runnersSettingsURL: URL? {
+        switch self {
+        case let .repo(owner, repo): return URL(string: "https://github.com/\(owner)/\(repo)/settings/actions/runners")
+        case let .org(org): return URL(string: "https://github.com/organizations/\(org)/settings/actions/runners")
+        case let .enterprise(name): return URL(string: "https://github.com/enterprises/\(name)/settings/actions/runners")
+        case .unknown: return nil
+        }
+    }
+
     /// API base path for the self-hosted runner endpoints, e.g. `/repos/owner/repo`
     /// or `/orgs/org` or `/enterprises/name`. Returns nil for `.unknown`.
     var apiBasePath: String? {

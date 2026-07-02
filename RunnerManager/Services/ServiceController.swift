@@ -66,7 +66,14 @@ enum ServiceController {
     /// Restart = stop then start. We deliberately run them as two discrete svc.sh calls (matching
     /// what a user would do by hand) so each step's error is mapped/surfaced precisely.
     static func restart(_ runner: Runner) async throws {
-        try await stop(runner)
+        // The stop phase is best-effort: svc.sh stop returns non-zero when the agent is already
+        // unloaded, which must NOT abort the restart. Log and always proceed to the authoritative
+        // start.
+        do {
+            try await stop(runner)
+        } catch {
+            Log.info("ServiceController.restart: stop phase failed (continuing to start): \(error.localizedDescription)")
+        }
         try await start(runner)
     }
 
@@ -168,32 +175,19 @@ enum ServiceController {
     }
 
     /// Heuristic for "this looks like a launchd privilege / session failure" so we can redirect the
-    /// user to Terminal with an active login session. We require a `Failed`/load/unload signal AND a
-    /// domain/session/permission hint to avoid misclassifying unrelated `Failed:` messages.
+    /// user to Terminal with an active login session. We require an EXPLICIT privilege/session token
+    /// to avoid false positives: the benign "already unloaded" messages ("could not find" /
+    /// "no such process") must NOT be treated as privilege errors, so the real AppError.process is
+    /// surfaced instead.
     private static func isLaunchctlSessionFailure(_ lower: String) -> Bool {
-        let mentionsLoadUnload =
-            lower.contains("load") ||
-            lower.contains("unload") ||
-            lower.contains("bootstrap") ||
-            lower.contains("bootout") ||
-            lower.contains("failed")
-
-        guard mentionsLoadUnload else { return false }
-
-        // Domain/session/permission hints emitted by launchctl when there's no active GUI session
-        // or insufficient privileges to operate in the user's launchd domain.
-        let sessionHints = [
-            "domain",                 // "Could not find domain for ..."
-            "gui",                    // gui/<uid> domain references
-            "no such process",        // unload when nothing is loaded in this session
-            "operation not permitted",
-            "permission denied",
-            "not permitted",
-            "input/output error",     // common when the user domain is unavailable
-            "could not find",
-            "bootstrap"
-        ]
-        return sessionHints.contains { lower.contains($0) }
+        // Explicit tokens only. Note we match "gui/" (the gui/<uid> domain path), NOT a bare "gui"
+        // substring, and "could not find domain" specifically (not the bare "could not find" case
+        // that also covers "already unloaded").
+        if lower.contains("operation not permitted") { return true }
+        if lower.contains("permission denied") { return true }
+        if lower.contains("could not find domain") { return true }
+        if lower.contains("gui/") { return true }
+        return false
     }
 
     // MARK: - launchctl fallback
@@ -211,9 +205,13 @@ enum ServiceController {
             )
             // `launchctl list <label>` exits non-zero when the label isn't loaded in this domain.
             guard result.succeeded else {
-                // Not loaded. We can't tell "not installed" from "installed but stopped" purely from
-                // launchctl, but for a known label the service exists, so report Stopped.
-                return .stopped
+                // Not loaded. Distinguish "installed but stopped" from "not installed" by checking
+                // for the LaunchAgent plist on disk: present -> .stopped, absent -> .notInstalled.
+                let plist = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library")
+                    .appendingPathComponent("LaunchAgents")
+                    .appendingPathComponent("\(label).plist")
+                return FileManager.default.fileExists(atPath: plist.path) ? .stopped : .notInstalled
             }
             // Parse the "PID" = <n>; line from the plist-ish dump.
             if let pid = extractLaunchctlListPID(from: result.stdout) {

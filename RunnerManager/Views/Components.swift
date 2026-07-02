@@ -87,6 +87,53 @@ struct UpdateBadge: View {
     }
 }
 
+// MARK: - APIStateBadge
+
+/// A compact badge showing GitHub's *server-side* view of a runner: a cloud glyph for
+/// online/offline plus an optional "running a job" indicator when GitHub reports the
+/// runner as busy.
+///
+/// This is deliberately distinct from `StatusDot` (which reflects the LOCAL launchd
+/// service status) so the two can sit side by side in a row. Callers should only render
+/// this when the API state is actually known (`Runner.gitHubOnline != nil`).
+struct APIStateBadge: View {
+    /// GitHub's reported online state (from `APIRunner.status == "online"`).
+    let online: Bool
+    /// Whether GitHub reports this runner as mid-job (from `APIRunner.busy`).
+    var busy: Bool = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: online ? "cloud.fill" : "cloud")
+                .font(.caption2)
+                .foregroundColor(online ? .green : .secondary)
+                .accessibilityHidden(true)
+
+            if busy {
+                // A small gear reads as "running a job" without adding text width.
+                Image(systemName: "gearshape.fill")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .accessibilityHidden(true)
+            }
+        }
+        .help(helpText)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(accessibilityLabel))
+    }
+
+    private var accessibilityLabel: String {
+        var parts = [online ? "GitHub online" : "GitHub offline"]
+        if busy { parts.append("running a job") }
+        return parts.joined(separator: ", ")
+    }
+
+    private var helpText: String {
+        if busy { return online ? "Online on GitHub — running a job" : "Running a job" }
+        return online ? "Online on GitHub" : "Offline on GitHub"
+    }
+}
+
 // MARK: - BannerView
 
 /// A colored, dismissible bar shown at the top of the window for errors / info / success.

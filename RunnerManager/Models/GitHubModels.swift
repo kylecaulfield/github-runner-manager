@@ -37,12 +37,24 @@ struct GitHubRelease: Codable, Equatable {
     /// The macOS Apple-Silicon runner asset.
     ///
     /// GitHub names this asset `actions-runner-osx-arm64-<version>.tar.gz`
-    /// (the version embedded here has NO leading 'v', unlike `tagName`). We match by
-    /// the documented prefix + extension rather than reconstructing the URL, since the
-    /// release JSON already gives us a valid (possibly signed-redirecting) download URL.
+    /// (the version embedded here has NO leading 'v', unlike `tagName`). We prefer the
+    /// EXACT documented name so we always pick the canonical full package. If that isn't
+    /// present we fall back to the prefix/suffix match, but EXCLUDE the trimmed variants
+    /// (`-noexternals` / `-noruntime`) — those omit bits required to actually run jobs.
+    /// We match by name rather than reconstructing the URL, since the release JSON already
+    /// gives us a valid (possibly signed-redirecting) download URL.
     func macOSArm64Asset() -> GitHubAsset? {
-        assets.first { asset in
-            asset.name.hasPrefix("actions-runner-osx-arm64-") && asset.name.hasSuffix(".tar.gz")
+        // 1. Exact canonical name for this release's normalized version.
+        let exactName = "actions-runner-osx-arm64-\(version).tar.gz"
+        if let exact = assets.first(where: { $0.name == exactName }) {
+            return exact
+        }
+        // 2. Fallback: prefix/suffix match, excluding trimmed packages that can't run jobs.
+        return assets.first { asset in
+            asset.name.hasPrefix("actions-runner-osx-arm64-")
+                && asset.name.hasSuffix(".tar.gz")
+                && !asset.name.contains("-noexternals")
+                && !asset.name.contains("-noruntime")
         }
     }
 }

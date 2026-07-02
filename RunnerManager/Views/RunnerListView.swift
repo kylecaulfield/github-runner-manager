@@ -1,39 +1,73 @@
 import SwiftUI
+import AppKit   // NSWorkspace / NSPasteboard for the per-row context menu actions
 
-/// The sidebar list of discovered runners.
+/// The list of discovered runners.
 ///
 /// Binds a `List` `selection` to the parent's selected runner id so the detail pane can follow
-/// the selection. Each row is a `RunnerRowView`. When discovery has found nothing, an empty-state
+/// the selection. Each row is a `RunnerRowView`. When there is nothing to show, an empty-state
 /// placeholder explains where to look (Settings search paths) and how to add a runner.
 ///
-/// The list itself performs no actions; it observes `AppState.runners` for content and forwards
-/// selection to `RootView` via the `selection` binding.
+/// The list itself performs no discovery or sorting: `RootView` now owns filtering/sorting and
+/// passes the already-prepared `runners` in. The only actions it performs are the per-row
+/// context-menu commands (start/stop/open/copy), which it forwards to `AppState`.
 struct RunnerListView: View {
+    /// The runners to display, already filtered and sorted by `RootView`.
+    let runners: [Runner]
+
     /// The id (== install path) of the currently selected runner, owned by `RootView`.
     /// Optional so "no selection" is representable (and so the detail pane can show a placeholder).
     @Binding var selection: Runner.ID?
 
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var settings: AppSettings
 
     var body: some View {
         Group {
-            if appState.runners.isEmpty {
+            if runners.isEmpty {
                 emptyState
             } else {
                 // `List(selection:)` over Identifiable rows: tag is each Runner's `id`.
                 List(selection: $selection) {
-                    ForEach(appState.runners) { runner in
+                    ForEach(runners) { runner in
                         RunnerRowView(runner: runner)
                             // Tag explicitly so selection binds to the runner id even though
                             // we iterate with ForEach inside the List.
                             .tag(runner.id)
+                            .contextMenu { contextMenu(for: runner) }
                     }
                 }
-                // A plain sidebar list reads well in a NavigationSplitView's leading column.
-                .listStyle(.sidebar)
+                // An inset list reads well now that the list is a primary content column
+                // (RootView composes it directly rather than as a sidebar).
+                .listStyle(.inset)
             }
         }
         .frame(minWidth: 240)
+    }
+
+    /// Per-row right-click actions. These are the list's only side effects; each start/stop
+    /// hands off to `AppState` (which owns busy plumbing), while copy/open use AppKit directly.
+    @ViewBuilder
+    private func contextMenu(for runner: Runner) -> some View {
+        Button("Start") { Task { await appState.start(runner) } }
+        Button("Stop") { Task { await appState.stop(runner) } }
+
+        Divider()
+
+        if let url = runner.scope.runnersSettingsURL {
+            Button("Open on GitHub") { NSWorkspace.shared.open(url) }
+        }
+
+        Divider()
+
+        Button("Copy Install Path") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(runner.installPath.path, forType: .string)
+        }
+        Button("Copy Labels") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(runner.labels.joined(separator: ", "), forType: .string)
+        }
+        .disabled(runner.labels.isEmpty)
     }
 
     /// Shown when no runners were discovered. Guides the user to Settings / adding a runner.
@@ -61,7 +95,7 @@ struct RunnerListView: View {
                 Text("Searched roots")
                     .font(.caption.bold())
                     .foregroundColor(.secondary)
-                ForEach(appState.settings.searchPaths, id: \.self) { path in
+                ForEach(settings.searchPaths, id: \.self) { path in
                     Text(path)
                         .font(.caption.monospaced())
                         .foregroundColor(.secondary)

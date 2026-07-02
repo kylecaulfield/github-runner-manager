@@ -77,7 +77,7 @@ enum RunnerUpdater {
         let cacheDir = downloadCache ?? AppPaths.downloadCache
         try AppPaths.ensureDirectory(cacheDir)
         let tarball = cacheDir.appendingPathComponent(asset.name)
-        if isUsableCachedFile(tarball) {
+        if isUsableCachedFile(tarball, asset: asset) {
             await report(progress, "Reusing cached download \(asset.name)")
         } else {
             await report(progress, "Downloading \(asset.name)…")
@@ -197,12 +197,18 @@ enum RunnerUpdater {
 
     // MARK: - Helpers
 
-    /// A cached download is usable iff the file exists AND is non-empty.
-    private static func isUsableCachedFile(_ url: URL) -> Bool {
+    /// A cached download is usable iff the file exists AND is non-empty. When the release asset
+    /// reports a `size`, the cached file must match it exactly — a mismatch means a truncated/partial
+    /// prior download, so we re-fetch. When the size is unknown we fall back to the "exists && >0" check.
+    private static func isUsableCachedFile(_ url: URL, asset: GitHubAsset) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: url.path) else { return false }
-        let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int
-        return (size ?? 0) > 0
+        let onDisk = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int
+        guard let onDisk, onDisk > 0 else { return false }
+        if let expected = asset.size, expected > 0 {
+            return onDisk == expected
+        }
+        return true
     }
 
     /// Hop a progress line back to the main actor for the UI.

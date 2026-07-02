@@ -15,7 +15,10 @@ enum RunnerDiscovery {
     /// runner's own large/working subtrees plus common noise — recursing into them wastes
     /// time and can never contain a *separate* runner install.
     private static let skippedDirectoryNames: Set<String> = [
-        "_work", "_diag", "externals", "bin", "node_modules"
+        "_work", "_diag", "externals", "bin", "node_modules",
+        // Belt-and-braces: never descend into the user's Library or Trash. ~/Library is not hidden
+        // by the leading-dot rule, so name-skipping it does not rely solely on the hidden flag.
+        "Library", ".Trash"
     ]
 
     /// The three on-disk markers that, together, identify a runner install directory.
@@ -44,8 +47,9 @@ enum RunnerDiscovery {
 
         for root in roots {
             for installDir in installDirectories(under: root, maxDepth: maxDepth) {
-                // Identity is the standardized path; collapse duplicates across roots.
-                let key = installDir.standardizedFileURL.path
+                // Identity is the fully symlink-resolved path so a symlink-aliased install (reachable
+                // via a link or from two roots) collapses to one entry.
+                let key = installDir.resolvingSymlinksInPath().path
                 if seenPaths.insert(key).inserted {
                     results.append(makeRunner(installPath: installDir))
                 }
@@ -135,9 +139,10 @@ enum RunnerDiscovery {
     /// as `actions.runner.<sanitized-scope>.<name>` (matching svc.sh's `SVC_NAME` scheme) and
     /// the plist path is derived as `~/Library/LaunchAgents/<label>.plist`.
     static func makeRunner(installPath: URL) -> Runner {
-        // Normalize so `id` (== installPath.path) is stable regardless of trailing slashes
-        // or `..`/`.` components in the discovered URL.
-        let normalizedInstall = installPath.standardizedFileURL
+        // Resolve symlinks (this also standardizes the path) so `id` (== installPath.path) is the
+        // canonical install location: a symlink-aliased install isn't double-listed, and trailing
+        // slashes / `..`/`.` components are collapsed.
+        let normalizedInstall = installPath.resolvingSymlinksInPath()
 
         let config = parseRunnerConfig(at: normalizedInstall)
 
@@ -185,7 +190,8 @@ enum RunnerDiscovery {
     ///
     /// Depth semantics: `root` is depth 0. If the root itself is an install it is returned and
     /// we do NOT descend into it (a runner install never contains another install). Otherwise
-    /// each immediate subdirectory is depth 1, and so on until `maxDepth` is reached.
+    /// each immediate subdirectory is depth 1, and so on until `maxDepth` is reached. Symlinks are
+    /// followed, but a set of visited RESOLVED paths breaks cycles and avoids re-scanning aliases.
     private static func installDirectories(under root: URL, maxDepth: Int) -> [URL] {
         let fm = FileManager.default
 
@@ -196,11 +202,18 @@ enum RunnerDiscovery {
         }
 
         var found: [URL] = []
+        // Resolved paths already visited — breaks symlink cycles and de-dups directories reachable
+        // via more than one link. Everything pushed onto the stack is already symlink-resolved.
+        var visited = Set<String>()
 
         // Iterative DFS with explicit depth tracking (avoids deep recursion and lets us cap depth).
-        var stack: [(url: URL, depth: Int)] = [(root.standardizedFileURL, 0)]
+        // Seed with the symlink-resolved root so cycle detection lives in the resolved namespace.
+        var stack: [(url: URL, depth: Int)] = [(root.resolvingSymlinksInPath(), 0)]
 
         while let (dir, depth) = stack.popLast() {
+            // Cycle / alias guard: skip a resolved directory we've already visited.
+            guard visited.insert(dir.resolvingSymlinksInPath().path).inserted else { continue }
+
             if isRunnerInstall(dir) {
                 // Found an install: record it and do not descend further into it.
                 found.append(dir)
@@ -218,9 +231,10 @@ enum RunnerDiscovery {
         return found
     }
 
-    /// The immediate subdirectories of `directory` worth descending into: real directories
-    /// (following symlinks would risk cycles, so we skip symlinks), excluding hidden names
-    /// (leading ".") and the well-known runner/noise directories.
+    /// The immediate subdirectories of `directory` worth descending into, with symlinks RESOLVED so
+    /// a symlinked runner install (or a symlinked parent directory) is followed. Excludes hidden
+    /// names (leading ".") and the well-known runner/noise directories. Cycle safety is the caller's
+    /// responsibility: it tracks visited resolved paths.
     private static func childDirectories(of directory: URL) -> [URL] {
         let fm = FileManager.default
         // .skipsHiddenFiles also drops dotfiles like `.runner`, which we don't want to descend
@@ -241,12 +255,15 @@ enum RunnerDiscovery {
             if name.hasPrefix(".") { continue }                    // hidden dir
             if skippedDirectoryNames.contains(name) { continue }   // runner internals / noise
 
-            let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            // Skip symlinks to avoid traversal cycles and following links out of the search root.
-            if values?.isSymbolicLink == true { continue }
-            if values?.isDirectory == true {
-                children.append(entry.standardizedFileURL)
+            // Resolve symlinks so a symlinked directory (install or intermediate) is followed. The
+            // resolved target is then tested for being a directory; cycles are broken by the caller's
+            // visited-resolved-paths set.
+            let resolved = entry.resolvingSymlinksInPath()
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: resolved.path, isDirectory: &isDir), isDir.boolValue else {
+                continue
             }
+            children.append(resolved)
         }
         return children
     }
@@ -272,7 +289,9 @@ enum RunnerDiscovery {
         case let .org(org):
             scopeComponent = org
         case let .enterprise(enterprise):
-            scopeComponent = enterprise
+            // Matches svc.sh/config.sh URL-path derivation for enterprise scope (the runner is
+            // configured against .../enterprises/<name>), NOT the bare enterprise name.
+            scopeComponent = "enterprises-\(enterprise)"
         case .unknown:
             // No reliable scope to embed; svc.sh would use the configured value, which we don't
             // have. Use a stable placeholder so a label can still be constructed.
